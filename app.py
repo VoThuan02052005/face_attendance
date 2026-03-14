@@ -240,12 +240,21 @@ if page == "🏠 Chấm công":
                             if name == "Không nhận diện được":
                                 st.error(f"❓ **{name}** – Khuôn mặt không có trong hệ thống")
                             else:
-                                saved = record_attendance(name)
-                                if saved:
-                                    st.success(f"✅ **{name}** – Chấm công thành công!")
+                                att = record_attendance(name)
+                                status = att["status"]
+                                if status == "checked_in":
+                                    st.success(f"🟢 **{name}** – Đã vào lúc **{att['check_in']}** (giờ Việt Nam)")
                                     st.balloons()
-                                else:
-                                    st.info(f"ℹ️ **{name}** – Đã chấm công hôm nay rồi.")
+                                elif status == "checked_out":
+                                    hours = att['total_hours']
+                                    h = int(hours)
+                                    m = int((hours - h) * 60)
+                                    st.success(f"🔴 **{name}** – Đã ra lúc **{att['check_out']}** · Tổng: **{h}h{m:02d}m**")
+                                    st.balloons()
+                                else:  # already_done
+                                    st.info(f"ℹ️ **{name}** – Đã hoàn tất chấm công hôm nay\n"
+                                            f"Vào: {att['check_in']} | Ra: {att['check_out']} | "
+                                            f"Tổng: {att['total_hours']}h")
         else:
             st.markdown("""
             <div class="card" style="text-align:center; padding: 2.5rem 1rem; color: #94a3b8;">
@@ -259,8 +268,12 @@ if page == "🏠 Chấm công":
     st.markdown("### 📊 Chấm công hôm nay")
     today_records = get_attendance_today()
     if today_records:
-        df_today = pd.DataFrame(today_records)[["name", "timestamp"]]
-        df_today.columns = ["Nhân viên", "Thời gian"]
+        df_today = pd.DataFrame(today_records)
+        # Chọn các cột có sẵn
+        cols = [c for c in ["name", "check_in", "check_out", "total_hours"] if c in df_today.columns]
+        df_today = df_today[cols].copy()
+        rename_map = {"name": "Nhân viên", "check_in": "Giờ Vào", "check_out": "Giờ Ra", "total_hours": "Tổng giờ (h)"}
+        df_today.rename(columns=rename_map, inplace=True)
         df_today.index = range(1, len(df_today) + 1)
         st.dataframe(df_today, use_container_width=True)
     else:
@@ -381,19 +394,31 @@ elif page == "📋 Lịch sử chấm công":
     records = get_attendance_history(filter_date=date_str)
 
     if records:
-        df = pd.DataFrame(records)[["name", "timestamp", "date"]]
-        df.columns = ["Nhân viên", "Thời gian chấm công", "Ngày"]
+        df = pd.DataFrame(records)
+        # Chọn và đổi tên columns
+        available = [c for c in ["name", "date", "check_in", "check_out", "total_hours"] if c in df.columns]
+        df = df[available].copy()
+        rename_map = {
+            "name": "Nhân viên",
+            "date": "Ngày",
+            "check_in": "Giờ Vào",
+            "check_out": "Giờ Ra",
+            "total_hours": "Tổng giờ (h)",
+        }
+        df.rename(columns=rename_map, inplace=True)
         df.index = range(1, len(df) + 1)
 
         # Metrics tổng quan
         total = len(df)
         unique_emp = df["Nhân viên"].nunique()
         unique_days = df["Ngày"].nunique()
+        total_hours_sum = df["Tổng giờ (h)"].sum() if "Tổng giờ (h)" in df.columns else 0
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("📌 Tổng bản ghi", total)
         m2.metric("👥 Nhân viên", unique_emp)
         m3.metric("📅 Số ngày", unique_days)
+        m4.metric("⏱️ Tổng giờ làm", f"{total_hours_sum:.1f}h")
 
         st.markdown("---")
         st.dataframe(df, use_container_width=True, height=420)

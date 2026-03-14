@@ -1,12 +1,24 @@
 """
 db_utils.py - Xử lý cơ sở dữ liệu SQLite cho hệ thống chấm công
+Múi giờ: Việt Nam (UTC+7) dùng zoneinfo
 """
 
 import sqlite3
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 
-# Đường dẫn tuyệt đối tới file database
+# ── Múi giờ Việt Nam ──────────────────────────────────────────────────────────
+VN_TZ = timezone(timedelta(hours=7))
+
+def now_vn() -> datetime:
+    """Trả về thời gian hiện tại theo múi giờ Việt Nam."""
+    return datetime.now(VN_TZ)
+
+def today_vn() -> str:
+    """Trả về ngày hôm nay theo VN (YYYY-MM-DD)."""
+    return now_vn().date().isoformat()
+
+# ── Đường dẫn DB ──────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "database", "attendance.db")
 
@@ -34,15 +46,29 @@ def init_db():
         )
     """)
 
-    # Bảng attendance
+    # Bảng attendance (schema mới: check_in + check_out + total_hours)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS attendance (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            name      TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            date      TEXT NOT NULL
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            date        TEXT NOT NULL,
+            check_in    TEXT,
+            check_out   TEXT,
+            total_hours REAL
         )
     """)
+
+    # Migration: nếu bảng cũ có cột timestamp → thêm cột mới
+    existing = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(attendance)").fetchall()
+    }
+    if "timestamp" in existing and "check_in" not in existing:
+        cursor.execute("ALTER TABLE attendance ADD COLUMN check_in TEXT")
+        cursor.execute("ALTER TABLE attendance ADD COLUMN check_out TEXT")
+        cursor.execute("ALTER TABLE attendance ADD COLUMN total_hours REAL")
+        # Chuyển dữ liệu cũ: timestamp → check_in
+        cursor.execute("UPDATE attendance SET check_in = timestamp WHERE check_in IS NULL")
 
     conn.commit()
     conn.close()
@@ -53,10 +79,7 @@ def init_db():
 # ---------------------------------------------------------------------------
 
 def add_employee(name: str, image_path: str) -> bool:
-    """
-    Thêm nhân viên mới vào CSDL.
-    Trả về True nếu thêm thành công, False nếu tên đã tồn tại.
-    """
+    """Thêm nhân viên. Trả về True nếu thành công, False nếu trùng tên."""
     try:
         conn = get_connection()
         conn.execute(
@@ -87,60 +110,103 @@ def delete_employee(name: str):
 
 
 # ---------------------------------------------------------------------------
-# Attendance
+# Attendance – Check-in / Check-out
 # ---------------------------------------------------------------------------
 
-def has_checked_in_today(name: str) -> bool:
-    """
-    Kiểm tra nhân viên đã chấm công hôm nay chưa.
-    Tránh ghi trùng nhiều lần trong cùng một ngày.
-    """
-    today = date.today().isoformat()
-    conn = get_connection()
+def _get_today_record(name: str, conn) -> dict | None:
+    """Lấy bản ghi chấm công hôm nay của nhân viên (nếu có)."""
+    today = today_vn()
     row = conn.execute(
-        "SELECT id FROM attendance WHERE name = ? AND date = ?",
+        "SELECT * FROM attendance WHERE name = ? AND date = ?",
         (name, today),
     ).fetchone()
-    conn.close()
-    return row is not None
+    return dict(row) if row else None
 
 
-def record_attendance(name: str) -> bool:
+def record_attendance(name: str) -> dict:
     """
-    Ghi chấm công cho nhân viên.
-    Trả về True nếu ghi thành công, False nếu đã chấm công hôm nay.
+    Logic chấm công thông minh:
+    - Lần 1 trong ngày → ghi giờ VÀO (check_in)
+    - Lần 2 → ghi giờ RA (check_out) và tính tổng giờ làm
+    - Lần 3+ → thông báo đã hoàn tất
+
+    Returns:
+        {
+          "status": "checked_in" | "checked_out" | "already_done",
+          "check_in": str,
+          "check_out": str | None,
+          "total_hours": float | None,
+        }
     """
-    if has_checked_in_today(name):
-        return False
-
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    today = now.date().isoformat()
-
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO attendance (name, timestamp, date) VALUES (?, ?, ?)",
-        (name, timestamp, today),
-    )
-    conn.commit()
-    conn.close()
-    return True
+    record = _get_today_record(name, conn)
+    now = now_vn()
+    time_str = now.strftime("%H:%M:%S")
 
+    if record is None:
+        # Lần đầu → check-in
+        conn.execute(
+            "INSERT INTO attendance (name, date, check_in) VALUES (?, ?, ?)",
+            (name, today_vn(), time_str),
+        )
+        conn.commit()
+        conn.close()
+        return {"status": "checked_in", "check_in": time_str, "check_out": None, "total_hours": None}
+
+    if record["check_out"] is None:
+        # Đã check-in nhưng chưa check-out → ghi check-out
+        # Tính tổng giờ từ chuỗi HH:MM:SS (tránh vấn đề timezone-aware/naive)
+        fmt = "%H:%M:%S"
+        t_in  = datetime.strptime(record["check_in"], fmt)
+        t_out = datetime.strptime(time_str, fmt)
+        # Xử lý trường hợp vượt qua nửa đêm
+        delta_seconds = (t_out - t_in).total_seconds()
+        if delta_seconds < 0:
+            delta_seconds += 86400  # +24h
+        total_hours = round(delta_seconds / 3600, 2)
+
+        conn.execute(
+            "UPDATE attendance SET check_out = ?, total_hours = ? WHERE id = ?",
+            (time_str, total_hours, record["id"]),
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "status": "checked_out",
+            "check_in": record["check_in"],
+            "check_out": time_str,
+            "total_hours": total_hours,
+        }
+
+
+    # Đã có cả check_in và check_out
+    conn.close()
+    return {
+        "status": "already_done",
+        "check_in": record["check_in"],
+        "check_out": record["check_out"],
+        "total_hours": record["total_hours"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Queries
+# ---------------------------------------------------------------------------
 
 def get_attendance_history(filter_date: str | None = None) -> list[dict]:
     """
     Lấy lịch sử chấm công.
-    filter_date: chuỗi 'YYYY-MM-DD', nếu None thì lấy tất cả.
+    filter_date: 'YYYY-MM-DD', None = lấy tất cả.
     """
     conn = get_connection()
     if filter_date:
         rows = conn.execute(
-            "SELECT * FROM attendance WHERE date = ? ORDER BY timestamp DESC",
+            "SELECT * FROM attendance WHERE date = ? ORDER BY check_in DESC",
             (filter_date,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM attendance ORDER BY timestamp DESC"
+            "SELECT * FROM attendance ORDER BY date DESC, check_in DESC"
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -148,4 +214,15 @@ def get_attendance_history(filter_date: str | None = None) -> list[dict]:
 
 def get_attendance_today() -> list[dict]:
     """Lấy danh sách chấm công hôm nay."""
-    return get_attendance_history(filter_date=date.today().isoformat())
+    return get_attendance_history(filter_date=today_vn())
+
+
+def has_checked_in_today(name: str) -> bool:
+    """Kiểm tra nhân viên đã chấm công hôm nay chưa (backward compat)."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id FROM attendance WHERE name = ? AND date = ?",
+        (name, today_vn()),
+    ).fetchone()
+    conn.close()
+    return row is not None
