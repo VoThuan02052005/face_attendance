@@ -157,10 +157,11 @@ h2, h3 { color: #e2e8f0 !important; }
 # ── Khởi tạo DB ────────────────────────────────────────────────────────────────
 init_db()
 
-# ── Cache: load known faces (reload khi cần) ────────────────────────────────────
-@st.cache_data(show_spinner=False)
+# ── Cache: load known faces dùng cache_resource (InsightFace model là non-serializable)
+@st.cache_resource(show_spinner="⏳ Đang tải model nhận diện khuôn mặt...")
 def cached_known_faces():
     return load_known_faces()
+
 
 # ── Sidebar Navigation ─────────────────────────────────────────────────────────
 with st.sidebar:
